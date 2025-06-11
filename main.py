@@ -21,7 +21,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Configuration
-BOT_TOKEN = os.getenv(BOT_TOKEN)
+BOT_TOKEN = os.getenv("BOT_TOKEN")
 API_URL = 'https://wdzone-terabox-api.vercel.app/api?url='
 MAX_FILE_SIZE = 2 * 1024 * 1024 * 1024  # 2GB limit
 TELEGRAM_FILE_LIMIT = 2 * 1024 * 1024 * 1024  # 2GB Telegram limit for videos
