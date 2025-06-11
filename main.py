@@ -12,48 +12,43 @@ import aiohttp
 import aiofiles
 from datetime import datetime
 import mimetypes
-import tempfile
-import motor.motor_asyncio
-from gridfs import GridFS
-import pymongo
-from io import BytesIO
+from flask import Flask, request
+import threading
+from pymongo import MongoClient
+import gridfs
+import io
 
 # Configure logging
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
-)
+logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Configuration
 BOT_TOKEN = os.getenv('BOT_TOKEN', 'YOUR_BOT_TOKEN')
 MONGODB_URI = os.getenv('MONGODB_URI', 'mongodb+srv://Nischay999:Nischay999@cluster0.5kufo.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0')
-PORT = int(os.getenv('PORT', 8080))
 API_URL = 'https://wdzone-terabox-api.vercel.app/api?url='
 MAX_FILE_SIZE = 2 * 1024 * 1024 * 1024  # 2GB limit
-TELEGRAM_FILE_LIMIT = 2 * 1024 * 1024 * 1024  # 2GB Telegram limit (Premium)
 CHUNK_SIZE = 1024 * 1024  # 1MB chunks
+PORT = int(os.getenv('PORT', 8080))
 
 class TeraBoxBot:
     def __init__(self):
         self.application = Application.builder().token(BOT_TOKEN).build()
-        self.user_settings = {}  # Store user preferences
-        self.mongo_client = None
-        self.db = None
-        self.fs = None
+        self.user_settings = {}
+        self.setup_mongodb()
         self.setup_handlers()
     
-    async def init_mongodb(self):
-        """Initialize MongoDB connection"""
+    def setup_mongodb(self):
+        """Setup MongoDB connection"""
         try:
-            self.mongo_client = motor.motor_asyncio.AsyncIOMotorClient(MONGODB_URI)
+            self.mongo_client = MongoClient(MONGODB_URI)
             self.db = self.mongo_client.terabox_bot
-            # Test connection
-            await self.db.list_collection_names()
+            self.fs = gridfs.GridFS(self.db)
             logger.info("✅ MongoDB connected successfully")
         except Exception as e:
             logger.error(f"❌ MongoDB connection failed: {e}")
-            raise
+            self.mongo_client = None
+            self.db = None
+            self.fs = None
     
     def setup_handlers(self):
         """Setup command and message handlers"""
@@ -62,9 +57,7 @@ class TeraBoxBot:
         self.application.add_handler(CommandHandler("stats", self.stats))
         self.application.add_handler(CommandHandler("settings", self.settings))
         self.application.add_handler(CallbackQueryHandler(self.handle_callback))
-        self.application.add_handler(
-            MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_message)
-        )
+        self.application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_message))
     
     def get_user_setting(self, user_id, setting, default):
         """Get user setting with default value"""
@@ -78,8 +71,7 @@ class TeraBoxBot:
     
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Start command handler"""
-        welcome_text = """
-🚀 **TeraBox Direct Link Bot - Premium**
+        welcome_text = """🚀 **TeraBox Direct Link Bot - Premium**
 
 🔥 **Features:**
 • Extract direct download links from TeraBox
@@ -100,25 +92,18 @@ class TeraBoxBot:
 /stats - Bot statistics
 /settings - Configure bot settings
 
-⚡ **Just send a TeraBox link to get started!**
-        """
+⚡ **Just send a TeraBox link to get started!**"""
         
         keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("📚 Help", callback_data="help"),
-             InlineKeyboardButton("⚙️ Settings", callback_data="settings")],
+            [InlineKeyboardButton("📚 Help", callback_data="help"), InlineKeyboardButton("⚙️ Settings", callback_data="settings")],
             [InlineKeyboardButton("📊 Stats", callback_data="stats")]
         ])
         
-        await update.message.reply_text(
-            welcome_text,
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=keyboard
-        )
+        await update.message.reply_text(welcome_text, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
     
     async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Help command handler"""
-        help_text = """
-📖 **Detailed Help Guide**
+        help_text = """📖 **Detailed Help Guide**
 
 🔗 **Supported Links:**
 • TeraBox share links (https://terabox.com/...)
@@ -139,36 +124,25 @@ https://1024terabox.com/s/1XYZ789...
 ⚙️ **Settings:**
 • Video Format: Upload videos as Video or Document
 • Auto Upload: Enable/disable automatic upload
-• Quality: Choose upload quality preference
 
 ⚠️ **Limitations:**
 • Max file size: 2GB
 • Processing time varies with file size
 • Requires Telegram Premium for files >50MB
 
-🛠️ **Troubleshooting:**
-• Ensure link is public and accessible
-• Check if file hasn't expired
-• Large files may take several minutes
-
-💬 **Support:** Forward any issues to bot admin
-        """
+💬 **Support:** Forward any issues to bot admin"""
         
-        await update.message.reply_text(
-            help_text,
-            parse_mode=ParseMode.MARKDOWN
-        )
+        await update.message.reply_text(help_text, parse_mode=ParseMode.MARKDOWN)
     
     async def stats(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Stats command handler"""
-        stats_text = f"""
-📊 **Bot Statistics**
+        stats_text = f"""📊 **Bot Statistics**
 
 🕒 **Uptime:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 🤖 **Bot Version:** v4.0 Premium (2GB Full Files)
 ⚡ **Status:** Active
 🌐 **API Status:** Connected
-🗄️ **Storage:** MongoDB GridFS
+💾 **Storage:** MongoDB GridFS
 
 💾 **Current Limits:**
 • Max file processing: 2GB
@@ -176,13 +150,9 @@ https://1024terabox.com/s/1XYZ789...
 • Video format preservation
 • Concurrent downloads: 2
 
-👥 **Users:** {len(self.user_settings)} active users
-        """
+👥 **Users:** {len(self.user_settings)} active users"""
         
-        await update.message.reply_text(
-            stats_text,
-            parse_mode=ParseMode.MARKDOWN
-        )
+        await update.message.reply_text(stats_text, parse_mode=ParseMode.MARKDOWN)
     
     async def settings(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Settings command handler"""
@@ -190,34 +160,22 @@ https://1024terabox.com/s/1XYZ789...
         video_format = self.get_user_setting(user_id, 'video_format', 'video')
         auto_upload = self.get_user_setting(user_id, 'auto_upload', True)
         
-        settings_text = f"""
-⚙️ **Bot Settings**
+        settings_text = f"""⚙️ **Bot Settings**
 
 📹 **Video Format:** {'🎬 Video' if video_format == 'video' else '📄 Document'}
 🔄 **Auto Upload:** {'✅ Enabled' if auto_upload else '❌ Disabled'}
 
 **Current Settings:**
 • Videos will be uploaded as {'Video files' if video_format == 'video' else 'Documents'}
-• Auto upload is {'enabled' if auto_upload else 'disabled'}
-        """
+• Auto upload is {'enabled' if auto_upload else 'disabled'}"""
         
         keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton(
-                f"📹 Video Format: {'Video' if video_format == 'video' else 'Document'}", 
-                callback_data="toggle_video_format"
-            )],
-            [InlineKeyboardButton(
-                f"🔄 Auto Upload: {'ON' if auto_upload else 'OFF'}", 
-                callback_data="toggle_auto_upload"
-            )],
+            [InlineKeyboardButton(f"📹 Video Format: {'Video' if video_format == 'video' else 'Document'}", callback_data="toggle_video_format")],
+            [InlineKeyboardButton(f"🔄 Auto Upload: {'ON' if auto_upload else 'OFF'}", callback_data="toggle_auto_upload")],
             [InlineKeyboardButton("🔙 Back to Main", callback_data="main_menu")]
         ])
         
-        await update.message.reply_text(
-            settings_text,
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=keyboard
-        )
+        await update.message.reply_text(settings_text, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
     
     async def handle_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle callback queries from inline keyboards"""
@@ -228,13 +186,10 @@ https://1024terabox.com/s/1XYZ789...
         
         if query.data == "help":
             await self.help_command(update, context)
-        
         elif query.data == "stats":
             await self.stats(update, context)
-        
         elif query.data == "settings":
             await self.settings(update, context)
-        
         elif query.data == "toggle_video_format":
             current = self.get_user_setting(user_id, 'video_format', 'video')
             new_format = 'document' if current == 'video' else 'video'
@@ -245,7 +200,6 @@ https://1024terabox.com/s/1XYZ789...
                 f"Videos will now be uploaded as {'video files' if new_format == 'video' else 'documents'}.",
                 parse_mode=ParseMode.MARKDOWN
             )
-        
         elif query.data == "toggle_auto_upload":
             current = self.get_user_setting(user_id, 'auto_upload', True)
             new_setting = not current
@@ -256,7 +210,6 @@ https://1024terabox.com/s/1XYZ789...
                 f"Files will {'automatically be uploaded' if new_setting else 'only show direct links'}.",
                 parse_mode=ParseMode.MARKDOWN
             )
-        
         elif query.data == "main_menu":
             await self.start(update, context)
     
@@ -303,73 +256,23 @@ https://1024terabox.com/s/1XYZ789...
                 return 'photo'
         return 'document'
     
-    async def store_file_mongodb(self, file_data, filename):
-        """Store file in MongoDB GridFS"""
-        try:
-            collection = self.db.fs.files
-            chunks_collection = self.db.fs.chunks
-            
-            # Create file document
-            file_doc = {
-                'filename': filename,
-                'uploadDate': datetime.utcnow(),
-                'length': len(file_data),
-                'chunkSize': 261120,  # GridFS default chunk size
-                'md5': None
-            }
-            
-            # Insert file document
-            file_result = await collection.insert_one(file_doc)
-            file_id = file_result.inserted_id
-            
-            # Store file chunks
-            chunk_size = 261120
-            chunk_num = 0
-            
-            for i in range(0, len(file_data), chunk_size):
-                chunk_data = file_data[i:i + chunk_size]
-                chunk_doc = {
-                    'files_id': file_id,
-                    'n': chunk_num,
-                    'data': chunk_data
-                }
-                await chunks_collection.insert_one(chunk_doc)
-                chunk_num += 1
-            
-            return file_id
-            
-        except Exception as e:
-            logger.error(f"Error storing file in MongoDB: {e}")
+    def format_time(self, seconds):
+        """Format time in human readable format"""
+        if seconds < 60:
+            return f"{int(seconds)}s"
+        elif seconds < 3600:
+            return f"{int(seconds // 60)}m {int(seconds % 60)}s"
+        else:
+            return f"{int(seconds // 3600)}h {int((seconds % 3600) // 60)}m"
+    
+    async def download_and_store_file(self, url, filename, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Download file and store in MongoDB GridFS"""
+        if not self.fs:
+            await update.message.reply_text("❌ MongoDB storage not available")
             return None
-    
-    async def retrieve_file_mongodb(self, file_id):
-        """Retrieve file from MongoDB GridFS"""
+        
         try:
-            collection = self.db.fs.files
-            chunks_collection = self.db.fs.chunks
-            
-            # Get file metadata
-            file_doc = await collection.find_one({'_id': file_id})
-            if not file_doc:
-                return None
-            
-            # Get file chunks
-            chunks = chunks_collection.find({'files_id': file_id}).sort('n', 1)
-            file_data = b''
-            
-            async for chunk in chunks:
-                file_data += chunk['data']
-            
-            return file_data, file_doc['filename']
-            
-        except Exception as e:
-            logger.error(f"Error retrieving file from MongoDB: {e}")
-            return None, None
-    
-    async def download_to_mongodb(self, url, filename, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Download file directly to MongoDB without local storage"""
-        try:
-            timeout = aiohttp.ClientTimeout(total=3600)  # 1 hour timeout
+            timeout = aiohttp.ClientTimeout(total=3600)
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.get(url) as response:
                     if response.status != 200:
@@ -380,39 +283,37 @@ https://1024terabox.com/s/1XYZ789...
                     if total_size > MAX_FILE_SIZE:
                         await update.message.reply_text(
                             f"❌ File too large ({self.format_file_size(total_size)})\n"
-                            f"Maximum allowed: {self.format_file_size(MAX_FILE_SIZE)}\n\n"
-                            "🔗 Use the direct link to download manually."
+                            f"Maximum allowed: {self.format_file_size(MAX_FILE_SIZE)}"
                         )
                         return None
                     
                     progress_msg = await update.message.reply_text(
-                        f"⬇️ **Downloading to cloud storage...**\n"
-                        f"📊 File size: {self.format_file_size(total_size)}",
+                        f"⬇️ **Downloading to MongoDB...**\n📊 File size: {self.format_file_size(total_size)}",
                         parse_mode=ParseMode.MARKDOWN
                     )
                     
+                    # Store file in GridFS
+                    file_buffer = io.BytesIO()
                     downloaded = 0
                     last_update_time = time.time()
                     last_update_percent = 0
                     start_time = time.time()
-                    file_data = b''
                     
                     async for chunk in response.content.iter_chunked(CHUNK_SIZE):
-                        file_data += chunk
+                        file_buffer.write(chunk)
                         downloaded += len(chunk)
                         
                         if total_size > 0:
                             percent = (downloaded / total_size) * 100
                             current_time = time.time()
                             
-                            # Update every 5% or every 10 seconds
                             if (percent - last_update_percent >= 5) or (current_time - last_update_time >= 10):
                                 elapsed_time = current_time - start_time
                                 speed = downloaded / elapsed_time if elapsed_time > 0 else 0
                                 eta = (total_size - downloaded) / speed if speed > 0 else 0
                                 
                                 msg = (
-                                    f"⬇️ **Downloading to cloud...**\n"
+                                    f"⬇️ **Downloading to MongoDB...**\n"
                                     f"{self.progress_bar(percent)}\n"
                                     f"📊 {self.format_file_size(downloaded)} / {self.format_file_size(total_size)}\n"
                                     f"🚀 Speed: {self.format_file_size(speed)}/s\n"
@@ -427,68 +328,52 @@ https://1024terabox.com/s/1XYZ789...
                                     )
                                     last_update_percent = percent
                                     last_update_time = current_time
-                                except Exception as e:
-                                    logger.warning(f"Progress update failed: {e}")
+                                except:
+                                    pass
                     
-                    # Store in MongoDB
-                    await context.bot.edit_message_text(
-                        chat_id=update.effective_chat.id,
-                        message_id=progress_msg.message_id,
-                        text="💾 **Storing in cloud database...**",
-                        parse_mode=ParseMode.MARKDOWN
-                    )
-                    
-                    file_id = await self.store_file_mongodb(file_data, filename)
+                    # Store in GridFS
+                    file_buffer.seek(0)
+                    file_id = self.fs.put(file_buffer.getvalue(), filename=filename)
                     
                     await context.bot.delete_message(
                         chat_id=update.effective_chat.id,
                         message_id=progress_msg.message_id
                     )
                     
-                    return file_id, len(file_data)
+                    return file_id
                     
         except Exception as e:
-            logger.error(f"Download to MongoDB failed: {e}")
-            return None, 0
+            logger.error(f"Download failed: {e}")
+            return None
     
-    def format_time(self, seconds):
-        """Format time in human readable format"""
-        if seconds < 60:
-            return f"{int(seconds)}s"
-        elif seconds < 3600:
-            return f"{int(seconds // 60)}m {int(seconds % 60)}s"
-        else:
-            return f"{int(seconds // 3600)}h {int((seconds % 3600) // 60)}m"
-    
-    async def upload_from_mongodb(self, update: Update, context: ContextTypes.DEFAULT_TYPE, file_id, original_name: str, direct_link: str, file_size: int):
+    async def upload_file_from_mongodb(self, update: Update, context: ContextTypes.DEFAULT_TYPE, file_id, original_name: str, direct_link: str, file_size: int):
         """Upload file from MongoDB to Telegram"""
+        if not self.fs:
+            return
+        
         user_id = update.effective_user.id
         video_format = self.get_user_setting(user_id, 'video_format', 'video')
         
         try:
             upload_msg = await update.message.reply_text(
-                f"⬆️ **Uploading from cloud to Telegram...**\n"
-                f"📁 {original_name}\n"
-                f"📊 {self.format_file_size(file_size)}",
+                f"⬆️ **Uploading to Telegram...**\n📁 {original_name}\n📊 {self.format_file_size(file_size)}",
                 parse_mode=ParseMode.MARKDOWN
             )
             
-            # Retrieve file from MongoDB
-            file_data, filename = await self.retrieve_file_mongodb(file_id)
-            if not file_data:
-                raise Exception("Failed to retrieve file from database")
+            # Get file from GridFS
+            grid_file = self.fs.get(file_id)
+            file_data = grid_file.read()
             
             file_type = self.get_file_type(original_name)
             caption = f"📁 **{original_name}**\n📊 Size: {self.format_file_size(file_size)}"
             
-            # Create BytesIO object for upload
-            file_buffer = BytesIO(file_data)
-            file_buffer.name = original_name
+            file_obj = io.BytesIO(file_data)
+            file_obj.name = original_name
             
             if file_type == 'video' and video_format == 'video':
                 await context.bot.send_video(
                     chat_id=update.effective_chat.id,
-                    video=file_buffer,
+                    video=file_obj,
                     filename=original_name,
                     caption=caption,
                     parse_mode=ParseMode.MARKDOWN,
@@ -498,7 +383,7 @@ https://1024terabox.com/s/1XYZ789...
             elif file_type == 'audio':
                 await context.bot.send_audio(
                     chat_id=update.effective_chat.id,
-                    audio=file_buffer,
+                    audio=file_obj,
                     filename=original_name,
                     caption=caption,
                     parse_mode=ParseMode.MARKDOWN,
@@ -507,7 +392,7 @@ https://1024terabox.com/s/1XYZ789...
             elif file_type == 'photo':
                 await context.bot.send_photo(
                     chat_id=update.effective_chat.id,
-                    photo=file_buffer,
+                    photo=file_obj,
                     caption=caption,
                     parse_mode=ParseMode.MARKDOWN,
                     reply_to_message_id=update.message.message_id
@@ -515,7 +400,7 @@ https://1024terabox.com/s/1XYZ789...
             else:
                 await context.bot.send_document(
                     chat_id=update.effective_chat.id,
-                    document=file_buffer,
+                    document=file_obj,
                     filename=original_name,
                     caption=caption,
                     parse_mode=ParseMode.MARKDOWN,
@@ -526,10 +411,6 @@ https://1024terabox.com/s/1XYZ789...
                 chat_id=update.effective_chat.id,
                 message_id=upload_msg.message_id
             )
-            
-            # Clean up from MongoDB after successful upload
-            await self.db.fs.files.delete_one({'_id': file_id})
-            await self.db.fs.chunks.delete_many({'files_id': file_id})
             
             success_text = (
                 f"✅ **Upload completed successfully!**\n\n"
@@ -549,15 +430,21 @@ https://1024terabox.com/s/1XYZ789...
                 disable_web_page_preview=True
             )
             
+            # Clean up from MongoDB
+            self.fs.delete(file_id)
+            
         except Exception as e:
-            logger.error(f"Upload from MongoDB failed: {e}")
+            logger.error(f"Upload failed: {e}")
             await update.message.reply_text(
-                f"❌ **Upload failed**\n"
-                f"Error: {str(e)}\n\n"
-                f"🔗 **Direct Link:** [Download]({direct_link})",
+                f"❌ **Upload failed**\nError: {str(e)}\n\n🔗 **Direct Link:** [Download]({direct_link})",
                 parse_mode=ParseMode.MARKDOWN,
                 disable_web_page_preview=True
             )
+            # Clean up from MongoDB
+            try:
+                self.fs.delete(file_id)
+            except:
+                pass
     
     async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle incoming messages"""
@@ -566,18 +453,13 @@ https://1024terabox.com/s/1XYZ789...
         
         if not self.is_valid_terabox_url(text):
             await update.message.reply_text(
-                "❌ **Invalid URL**\n\n"
-                "Please send a valid TeraBox link:\n"
-                "• https://terabox.com/s/...\n"
-                "• https://1024terabox.com/s/...\n"
-                "• https://teraboxapp.com/s/...",
+                "❌ **Invalid URL**\n\nPlease send a valid TeraBox link:\n• https://terabox.com/s/...\n• https://1024terabox.com/s/...\n• https://teraboxapp.com/s/...",
                 parse_mode=ParseMode.MARKDOWN
             )
             return
         
         processing_msg = await update.message.reply_text(
-            "🔍 **Processing TeraBox link...**\n"
-            "⏳ Extracting file information...",
+            "🔍 **Processing TeraBox link...**\n⏳ Extracting file information...",
             parse_mode=ParseMode.MARKDOWN
         )
         
@@ -587,7 +469,6 @@ https://1024terabox.com/s/1XYZ789...
                 async with session.get(API_URL + text) as response:
                     if response.status != 200:
                         raise Exception(f"API returned status {response.status}")
-                    
                     data = await response.json()
             
             if "📜 Extracted Info" not in data or not data["📜 Extracted Info"]:
@@ -645,12 +526,9 @@ https://1024terabox.com/s/1XYZ789...
         except Exception as e:
             logger.error(f"Error processing TeraBox link: {e}")
             error_text = (
-                "❌ **Failed to process TeraBox link**\n\n"
-                "**Possible reasons:**\n"
-                "• Link has expired or is invalid\n"
-                "• File is private or restricted\n"
-                "• API service is temporarily down\n\n"
-                "🔄 **Try again or check the link**"
+                "❌ **Failed to process TeraBox link**\n\n**Possible reasons:**\n"
+                "• Link has expired or is invalid\n• File is private or restricted\n"
+                "• API service is temporarily down\n\n🔄 **Try again or check the link**"
             )
             
             await context.bot.edit_message_text(
@@ -663,66 +541,67 @@ https://1024terabox.com/s/1XYZ789...
     async def process_file_download(self, update: Update, context: ContextTypes.DEFAULT_TYPE, direct_link: str, file_name: str, file_size: int):
         """Process file download and upload using MongoDB"""
         try:
-            safe_filename = "".join(c for c in file_name if c.isalnum() or c in (' ', '.', '_', '-')).rstrip()
-            
-            file_id, actual_size = await self.download_to_mongodb(direct_link, safe_filename, update, context)
-            
+            file_id = await self.download_and_store_file(direct_link, file_name, update, context)
             if file_id:
-                await self.upload_from_mongodb(update, context, file_id, file_name, direct_link, actual_size)
-            
+                await self.upload_file_from_mongodb(update, context, file_id, file_name, direct_link, file_size)
         except Exception as e:
             logger.error(f"File processing failed: {e}")
             await update.message.reply_text(
-                f"❌ **Processing failed**\n"
-                f"Error: {str(e)}\n\n"
-                f"🔗 **Direct Link:** [Download]({direct_link})",
+                f"❌ **Processing failed**\nError: {str(e)}\n\n🔗 **Direct Link:** [Download]({direct_link})",
                 parse_mode=ParseMode.MARKDOWN,
                 disable_web_page_preview=True
             )
-    
-    async def run_polling(self):
-        """Run bot in polling mode"""
-        try:
-            logger.info("🚀 Starting TeraBox Bot Premium with MongoDB...")
-            
-            # Initialize MongoDB
-            await self.init_mongodb()
-            
-            # Initialize application
-            await self.application.initialize()
-            await self.application.start()
-            
-            # Start polling
-            await self.application.updater.start_polling(
-                poll_interval=1.0,
-                timeout=20,
-                bootstrap_retries=-1,
-                read_timeout=60,
-                write_timeout=60,
-                connect_timeout=60,
-                pool_timeout=60
-            )
-            
-            logger.info("✅ Bot is running and polling for updates...")
-            
-            # Keep the bot running
-            await self.application.updater.idle()
-            
-        except Exception as e:
-            logger.error(f"❌ Error starting bot: {e}")
-        finally:
-            # Cleanup
-            if self.mongo_client:
-                self.mongo_client.close()
-            await self.application.stop()
-            await self.application.shutdown()
+
+# Flask app for webhook
+app = Flask(__name__)
+bot_instance = TeraBoxBot()
+
+@app.route('/')
+def home():
+    return "TeraBox Bot is running!"
+
+@app.route(f'/{BOT_TOKEN}', methods=['POST'])
+def webhook():
+    """Handle webhook updates"""
+    try:
+        update = Update.de_json(request.get_json(force=True), bot_instance.application.bot)
+        asyncio.run(bot_instance.application.process_update(update))
+        return "OK"
+    except Exception as e:
+        logger.error(f"Webhook error: {e}")
+        return "Error", 500
+
+def run_flask():
+    """Run Flask app"""
+    app.run(host='0.0.0.0', port=PORT, debug=False)
+
+async def setup_webhook():
+    """Setup webhook for the bot"""
+    webhook_url = f"https://your-app-name.koyeb.app/{BOT_TOKEN}"
+    await bot_instance.application.bot.set_webhook(webhook_url)
+    logger.info(f"Webhook set to: {webhook_url}")
 
 def main():
-    """Main function to run the bot"""
+    """Main function to run the bot with Flask"""
     try:
-        bot = TeraBoxBot()
-        asyncio.run(bot.run_polling())
+        # Initialize the bot application
+        asyncio.run(bot_instance.application.initialize())
         
+        # Setup webhook
+        asyncio.run(setup_webhook())
+        
+        # Start Flask in a separate thread
+        flask_thread = threading.Thread(target=run_flask)
+        flask_thread.daemon = True
+        flask_thread.start()
+        
+        logger.info(f"🚀 TeraBox Bot started on port {PORT}")
+        logger.info("✅ Bot is running with MongoDB storage and webhook mode")
+        
+        # Keep the main thread alive
+        while True:
+            time.sleep(1)
+            
     except KeyboardInterrupt:
         logger.info("🛑 Bot stopped by user")
     except Exception as e:
@@ -733,7 +612,7 @@ if __name__ == '__main__':
         logger.error("❌ BOT_TOKEN environment variable not set!")
         exit(1)
     
-    if not MONGODB_URI or MONGODB_URI == 'mongodb://localhost:27017':
+    if not MONGODB_URI:
         logger.error("❌ MONGODB_URI environment variable not set!")
         exit(1)
     
