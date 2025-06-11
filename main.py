@@ -21,12 +21,11 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Configuration
-BOT_TOKEN = os.getenv('BOT_TOKEN')
+BOT_TOKEN = os.getenv(BOT_TOKEN)
 API_URL = 'https://wdzone-terabox-api.vercel.app/api?url='
 MAX_FILE_SIZE = 2 * 1024 * 1024 * 1024  # 2GB limit
-TELEGRAM_FILE_LIMIT = 50 * 1024 * 1024  # 50MB Telegram limit
-CHUNK_SIZE = 1024 * 1024  # 1MB chunks
-SPLIT_SIZE = 45 * 1024 * 1024  # 45MB per part for file splitting
+TELEGRAM_FILE_LIMIT = 2 * 1024 * 1024 * 1024  # 2GB Telegram limit for videos
+CHUNK_SIZE = 8 * 1024 * 1024  # 8MB chunks for better performance
 
 class TeraBoxBot:
     def __init__(self):
@@ -45,14 +44,14 @@ class TeraBoxBot:
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Start command handler"""
         welcome_text = """
-🚀 **TeraBox Direct Link Bot - Advanced**
+🚀 **TeraBox Direct Link Bot - 2GB Support**
 
 🔥 **Features:**
 • Extract direct download links from TeraBox
 • Auto-download and upload files (up to 2GB)
-• Large file splitting for Telegram compatibility
+• Support for large video files
 • Progress tracking with real-time updates
-• Support for multiple file formats
+• Multiple file format support
 
 📝 **How to use:**
 1. Send any TeraBox share link
@@ -95,13 +94,13 @@ https://1024terabox.com/s/1XYZ789...
 ```
 
 💾 **File Processing:**
-• Files under 50MB: Direct upload
-• Files 50MB-2GB: Auto-split into parts
-• Files over 2GB: Direct link only
+• Videos up to 2GB: Direct upload
+• Documents up to 50MB: Direct upload
+• Large files: Processed with progress tracking
 
 ⚠️ **Limitations:**
-• Max file processing: 2GB
-• Large files will be split into 45MB parts
+• Max video file: 2GB
+• Max document file: 50MB
 • Processing time varies with file size
 
 🛠️ **Troubleshooting:**
@@ -123,15 +122,15 @@ https://1024terabox.com/s/1XYZ789...
 📊 **Bot Statistics**
 
 🕒 **Uptime:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
-🤖 **Bot Version:** v3.0 Advanced (2GB Support)
+🤖 **Bot Version:** v3.1 (2GB Video Support)
 ⚡ **Status:** Active
 🌐 **API Status:** Connected
 
 💾 **Limits:**
-• Max file processing: 2GB
-• Telegram file limit: 50MB per part
-• Auto-splitting for large files
-• Concurrent downloads: 3
+• Max video file: 2GB
+• Max document file: 50MB
+• Optimized for large file processing
+• High-speed downloads with progress tracking
         """
         
         await update.message.reply_text(
@@ -165,40 +164,25 @@ https://1024terabox.com/s/1XYZ789...
         except:
             return False
     
-    async def split_file(self, file_path, part_size=SPLIT_SIZE):
-        """Split large file into smaller parts"""
-        parts = []
-        file_size = os.path.getsize(file_path)
+    def is_video_file(self, filename):
+        """Check if file is a video"""
+        video_extensions = ['.mp4', '.avi', '.mkv', '.mov', '.wmv', '.flv', '.webm', '.m4v', '.3gp']
+        return any(filename.lower().endswith(ext) for ext in video_extensions)
+    
+    def calculate_speed(self, bytes_downloaded, time_elapsed):
+        """Calculate download speed"""
+        if time_elapsed <= 0:
+            return "Unknown"
         
-        if file_size <= TELEGRAM_FILE_LIMIT:
-            return [file_path]
-        
-        logger.info(f"Splitting file {file_path} ({self.format_file_size(file_size)}) into parts")
-        
-        with open(file_path, 'rb') as f:
-            part_num = 1
-            while True:
-                chunk = f.read(part_size)
-                if not chunk:
-                    break
-                
-                part_path = f"{file_path}.part{part_num:03d}"
-                with open(part_path, 'wb') as part_file:
-                    part_file.write(chunk)
-                
-                parts.append(part_path)
-                part_num += 1
-        
-        # Remove original file to save space
-        os.remove(file_path)
-        logger.info(f"File split into {len(parts)} parts")
-        
-        return parts
+        speed_bps = bytes_downloaded / time_elapsed
+        return f"{self.format_file_size(speed_bps)}/s"
     
     async def download_file_async(self, url, file_path, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Download file asynchronously with progress tracking"""
         try:
-            async with aiohttp.ClientSession() as session:
+            timeout = aiohttp.ClientTimeout(total=3600)  # 1 hour timeout for large files
+            
+            async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.get(url) as response:
                     if response.status != 200:
                         raise Exception(f"HTTP {response.status}")
@@ -215,7 +199,8 @@ https://1024terabox.com/s/1XYZ789...
                     
                     progress_msg = await update.message.reply_text("⬇️ Starting download...")
                     downloaded = 0
-                    last_update_time = time.time()
+                    start_time = time.time()
+                    last_update_time = start_time
                     last_update_percent = 0
                     
                     async with aiofiles.open(file_path, 'wb') as f:
@@ -227,13 +212,19 @@ https://1024terabox.com/s/1XYZ789...
                                 percent = (downloaded / total_size) * 100
                                 current_time = time.time()
                                 
-                                # Update every 5% or every 10 seconds
-                                if (percent - last_update_percent >= 5) or (current_time - last_update_time >= 10):
+                                # Update every 5% or every 15 seconds
+                                if (percent - last_update_percent >= 5) or (current_time - last_update_time >= 15):
+                                    elapsed = current_time - start_time
+                                    speed = self.calculate_speed(downloaded, elapsed)
+                                    eta = ((total_size - downloaded) / (downloaded / elapsed)) if downloaded > 0 else 0
+                                    eta_str = f"{int(eta//60)}m {int(eta%60)}s" if eta > 0 else "Unknown"
+                                    
                                     msg = (
                                         f"⬇️ **Downloading...**\n"
                                         f"{self.progress_bar(percent)}\n"
                                         f"📊 {self.format_file_size(downloaded)} / {self.format_file_size(total_size)}\n"
-                                        f"🚀 Speed: {self.calculate_speed(downloaded, current_time - last_update_time)}"
+                                        f"🚀 Speed: {speed}\n"
+                                        f"⏱️ ETA: {eta_str}"
                                     )
                                     try:
                                         await context.bot.edit_message_text(
@@ -250,7 +241,7 @@ https://1024terabox.com/s/1XYZ789...
                     await context.bot.edit_message_text(
                         chat_id=update.effective_chat.id,
                         message_id=progress_msg.message_id,
-                        text="✅ Download completed! Processing file...",
+                        text="✅ Download completed! Preparing upload...",
                         parse_mode=ParseMode.MARKDOWN
                     )
                     
@@ -260,13 +251,75 @@ https://1024terabox.com/s/1XYZ789...
             logger.error(f"Download failed: {e}")
             return None
     
-    def calculate_speed(self, bytes_downloaded, time_elapsed):
-        """Calculate download speed"""
-        if time_elapsed <= 0:
-            return "Unknown"
-        
-        speed_bps = bytes_downloaded / time_elapsed
-        return f"{self.format_file_size(speed_bps)}/s"
+    async def upload_and_send_file(self, update: Update, context: ContextTypes.DEFAULT_TYPE, file_path: str, original_name: str):
+        """Upload and send file to user"""
+        try:
+            file_size = os.path.getsize(file_path)
+            is_video = self.is_video_file(original_name)
+            
+            # Check file size limits
+            limit = TELEGRAM_FILE_LIMIT if is_video else 50 * 1024 * 1024
+            
+            if file_size > limit:
+                os.remove(file_path)
+                file_type = "video" if is_video else "document"
+                await update.message.reply_text(
+                    f"❌ {file_type.title()} too large for Telegram ({self.format_file_size(file_size)})\n"
+                    f"Maximum allowed for {file_type}: {self.format_file_size(limit)}\n\n"
+                    "🔗 Use the direct download link instead."
+                )
+                return
+            
+            upload_msg = await update.message.reply_text("⬆️ **Uploading to Telegram...**\n⏳ Please wait...")
+            
+            # Send file based on type
+            with open(file_path, 'rb') as file:
+                if is_video:
+                    await context.bot.send_video(
+                        chat_id=update.effective_chat.id,
+                        video=file,
+                        filename=original_name,
+                        caption=f"🎥 **{original_name}**\n📊 Size: {self.format_file_size(file_size)}",
+                        parse_mode=ParseMode.MARKDOWN,
+                        reply_to_message_id=update.message.message_id,
+                        supports_streaming=True
+                    )
+                else:
+                    await context.bot.send_document(
+                        chat_id=update.effective_chat.id,
+                        document=file,
+                        filename=original_name,
+                        caption=f"📁 **{original_name}**\n📊 Size: {self.format_file_size(file_size)}",
+                        parse_mode=ParseMode.MARKDOWN,
+                        reply_to_message_id=update.message.message_id
+                    )
+            
+            # Clean up
+            try:
+                await context.bot.delete_message(
+                    chat_id=update.effective_chat.id,
+                    message_id=upload_msg.message_id
+                )
+            except:
+                pass
+            
+            os.remove(file_path)
+            
+            await update.message.reply_text(
+                "✅ **Upload completed successfully!**",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            
+        except Exception as e:
+            logger.error(f"Upload failed: {e}")
+            if os.path.exists(file_path):
+                os.remove(file_path)
+            await update.message.reply_text(
+                "❌ **Upload failed**\n"
+                "File might be corrupted or there was a network issue.\n"
+                "Please try again or use the direct download link.",
+                parse_mode=ParseMode.MARKDOWN
+            )
     
     async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle incoming messages"""
@@ -285,14 +338,15 @@ https://1024terabox.com/s/1XYZ789...
         
         processing_msg = await update.message.reply_text(
             "🔍 **Processing TeraBox link...**\n"
-            "⏳ This may take a few seconds",
+            "⏳ Extracting file information...",
             parse_mode=ParseMode.MARKDOWN
         )
         
         try:
             # Call API to extract direct link
-            async with aiohttp.ClientSession() as session:
-                async with session.get(API_URL + text, timeout=60) as response:
+            timeout = aiohttp.ClientTimeout(total=60)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(API_URL + text) as response:
                     if response.status != 200:
                         raise Exception(f"API returned status {response.status}")
                     
@@ -305,22 +359,30 @@ https://1024terabox.com/s/1XYZ789...
             file_info = data["📜 Extracted Info"][0]
             direct_link = file_info.get("🔽 Direct Download Link")
             file_name = file_info.get("📂 Title", f"terabox_file_{int(time.time())}")
-            file_size = file_info.get("📊 Size", "Unknown")
+            file_size_str = file_info.get("📊 Size", "Unknown")
             
             if not direct_link:
                 raise Exception("Direct download link not found")
             
+            # Clean filename
+            safe_filename = "".join(c for c in file_name if c.isalnum() or c in (' ', '.', '_', '-')).strip()
+            if not safe_filename:
+                safe_filename = f"terabox_file_{int(time.time())}"
+            
             # Create response with file info
+            is_video = self.is_video_file(file_name)
+            file_type_emoji = "🎥" if is_video else "📁"
+            
             info_text = (
                 f"✅ **Link Extracted Successfully!**\n\n"
-                f"📁 **File:** `{file_name}`\n"
-                f"📊 **Size:** {file_size}\n"
-                f"🔗 **Direct Link:** [Download]({direct_link})"
+                f"{file_type_emoji} **File:** `{file_name}`\n"
+                f"📊 **Size:** {file_size_str}\n"
+                f"🔗 **Direct Link:** [Download]({direct_link})\n\n"
+                f"⬇️ **Auto-downloading and uploading...**"
             )
             
             keyboard = InlineKeyboardMarkup([
-                [InlineKeyboardButton("📥 Direct Download", url=direct_link)],
-                [InlineKeyboardButton("🤖 Auto Download", callback_data=f"download_{hash(direct_link)}")],
+                [InlineKeyboardButton("📥 Direct Download", url=direct_link)]
             ])
             
             await context.bot.edit_message_text(
@@ -332,8 +394,8 @@ https://1024terabox.com/s/1XYZ789...
                 disable_web_page_preview=True
             )
             
-            # Auto-download files
-            await self.auto_download_and_send(update, context, direct_link, file_name)
+            # Start auto-download
+            await self.auto_download_and_send(update, context, direct_link, safe_filename)
             
         except Exception as e:
             logger.error(f"Error processing TeraBox link: {e}")
@@ -342,7 +404,8 @@ https://1024terabox.com/s/1XYZ789...
                 "**Possible reasons:**\n"
                 "• Link has expired or is invalid\n"
                 "• File is private or restricted\n"
-                "• API service is temporarily down\n\n"
+                "• API service is temporarily down\n"
+                "• Network connectivity issues\n\n"
                 "🔄 **Try again or check the link**"
             )
             
@@ -358,8 +421,7 @@ https://1024terabox.com/s/1XYZ789...
         try:
             # Generate unique file path
             timestamp = int(time.time())
-            safe_filename = "".join(c for c in file_name if c.isalnum() or c in (' ', '.', '_', '-')).rstrip()
-            file_path = f"./downloads/{timestamp}_{safe_filename}"
+            file_path = f"./downloads/{timestamp}_{file_name}"
             
             # Create downloads directory if it doesn't exist
             os.makedirs("./downloads", exist_ok=True)
@@ -369,6 +431,12 @@ https://1024terabox.com/s/1XYZ789...
             
             if downloaded_file:
                 await self.upload_and_send_file(update, context, downloaded_file, file_name)
+            else:
+                await update.message.reply_text(
+                    "❌ **Download failed**\n"
+                    "Please use the direct download link above.",
+                    parse_mode=ParseMode.MARKDOWN
+                )
             
         except Exception as e:
             logger.error(f"Auto download failed: {e}")
@@ -378,111 +446,20 @@ https://1024terabox.com/s/1XYZ789...
                 parse_mode=ParseMode.MARKDOWN
             )
     
-    async def upload_and_send_file(self, update: Update, context: ContextTypes.DEFAULT_TYPE, file_path: str, original_name: str):
-        """Upload and send file to user with file splitting support"""
-        try:
-            file_size = os.path.getsize(file_path)
-            
-            upload_msg = await update.message.reply_text("📁 **Processing file for upload...**")
-            
-            # Split file if needed
-            file_parts = await self.split_file(file_path)
-            
-            if len(file_parts) == 1:
-                # Single file upload
-                await context.bot.edit_message_text(
-                    chat_id=update.effective_chat.id,
-                    message_id=upload_msg.message_id,
-                    text="⬆️ **Uploading to Telegram...**"
-                )
-                
-                with open(file_parts[0], 'rb') as file:
-                    await context.bot.send_document(
-                        chat_id=update.effective_chat.id,
-                        document=file,
-                        filename=original_name,
-                        caption=f"📁 **{original_name}**\n📊 Size: {self.format_file_size(file_size)}",
-                        parse_mode=ParseMode.MARKDOWN,
-                        reply_to_message_id=update.message.message_id
-                    )
-                
-                os.remove(file_parts[0])
-            else:
-                # Multi-part file upload
-                await context.bot.edit_message_text(
-                    chat_id=update.effective_chat.id,
-                    message_id=upload_msg.message_id,
-                    text=f"⬆️ **Uploading {len(file_parts)} parts to Telegram...**"
-                )
-                
-                for i, part_path in enumerate(file_parts, 1):
-                    part_name = f"{original_name}.part{i:03d}"
-                    
-                    with open(part_path, 'rb') as file:
-                        await context.bot.send_document(
-                            chat_id=update.effective_chat.id,
-                            document=file,
-                            filename=part_name,
-                            caption=f"📁 **Part {i}/{len(file_parts)}**\n🔗 {original_name}\n📊 Size: {self.format_file_size(os.path.getsize(part_path))}",
-                            parse_mode=ParseMode.MARKDOWN,
-                            reply_to_message_id=update.message.message_id
-                        )
-                    
-                    os.remove(part_path)
-                
-                # Send instructions for combining parts
-                instructions = (
-                    f"📦 **File sent in {len(file_parts)} parts**\n\n"
-                    "🔧 **To combine parts:**\n"
-                    "• Download all parts\n"
-                    "• Use: `cat *.part* > filename` (Linux/Mac)\n"
-                    "• Or use file joining software (Windows)"
-                )
-                
-                await context.bot.send_message(
-                    chat_id=update.effective_chat.id,
-                    text=instructions,
-                    parse_mode=ParseMode.MARKDOWN,
-                    reply_to_message_id=update.message.message_id
-                )
-            
-            # Clean up
-            await context.bot.delete_message(
-                chat_id=update.effective_chat.id,
-                message_id=upload_msg.message_id
-            )
-            
-            await update.message.reply_text(
-                "✅ **Upload completed successfully!**",
-                parse_mode=ParseMode.MARKDOWN
-            )
-            
-        except Exception as e:
-            logger.error(f"Upload failed: {e}")
-            # Clean up any remaining files
-            if os.path.exists(file_path):
-                os.remove(file_path)
-            
-            await update.message.reply_text(
-                "❌ **Upload failed**\n"
-                "File might be corrupted or there was a network error.",
-                parse_mode=ParseMode.MARKDOWN
-            )
-    
     async def run_polling(self):
         """Run bot in polling mode"""
         try:
             logger.info("🚀 Starting TeraBox Bot in polling mode...")
             
-            # Initialize application
+            # Initialize and start application
             await self.application.initialize()
             await self.application.start()
             
             # Start polling
             await self.application.updater.start_polling(
-                poll_interval=1.0,
-                timeout=20,
-                bootstrap_retries=-1,
+                poll_interval=2.0,
+                timeout=30,
+                bootstrap_retries=5,
                 read_timeout=30,
                 write_timeout=30,
                 connect_timeout=30,
@@ -491,27 +468,40 @@ https://1024terabox.com/s/1XYZ789...
             
             logger.info("✅ Bot is running and polling for updates...")
             
-            # Keep the bot running
-            await self.application.updater.idle()
+            # Keep the application running
+            import signal
+            stop_signals = (signal.SIGINT, signal.SIGTERM)
+            
+            loop = asyncio.get_running_loop()
+            
+            def signal_handler():
+                logger.info("🛑 Received stop signal, shutting down...")
+                for task in asyncio.all_tasks(loop):
+                    task.cancel()
+            
+            for sig in stop_signals:
+                loop.add_signal_handler(sig, signal_handler)
+            
+            # Wait for tasks to complete
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                pass
             
         except Exception as e:
             logger.error(f"❌ Error starting bot: {e}")
         finally:
             # Cleanup
-            await self.application.stop()
-            await self.application.shutdown()
+            try:
+                await self.application.updater.stop()
+                await self.application.stop()
+                await self.application.shutdown()
+            except:
+                pass
 
 def main():
     """Main function to run the bot"""
     try:
-        # Check if BOT_TOKEN is set
-        if not BOT_TOKEN:
-            logger.error("❌ BOT_TOKEN environment variable not set!")
-            logger.info("💡 Please set your bot token:")
-            logger.info("   export BOT_TOKEN='your_bot_token_here'")
-            logger.info("   Or set it in Koyeb environment variables")
-            return
-        
         bot = TeraBoxBot()
         
         # Run the bot
@@ -523,8 +513,16 @@ def main():
         logger.error(f"❌ Fatal error: {e}")
 
 if __name__ == '__main__':
+    # Set up environment for Koyeb
+    if not BOT_TOKEN or BOT_TOKEN == 'YOUR_BOT_TOKEN':
+        logger.error("❌ BOT_TOKEN environment variable not set!")
+        exit(1)
+    
     # Clean up downloads directory on startup
     if os.path.exists('./downloads'):
-        shutil.rmtree('./downloads')
+        try:
+            shutil.rmtree('./downloads')
+        except:
+            pass
     
     main()
