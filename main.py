@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 # Configuration
 BOT_TOKEN = os.getenv('BOT_TOKEN', 'YOUR_BOT_TOKEN')
 MONGODB_URI = os.getenv('MONGODB_URI', 'mongodb+srv://Nischay999:Nischay999@cluster0.5kufo.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0')
-PORT = int(os.getenv('PORT', 8000))
+PORT = int(os.getenv('PORT', 8080))
 API_URL = 'https://wdzone-terabox-api.vercel.app/api?url='
 MAX_FILE_SIZE = 2 * 1024 * 1024 * 1024  # 2GB limit
 TELEGRAM_FILE_LIMIT = 2 * 1024 * 1024 * 1024  # 2GB Telegram limit (Premium)
@@ -505,4 +505,236 @@ https://1024terabox.com/s/1XYZ789...
                     reply_to_message_id=update.message.message_id
                 )
             elif file_type == 'photo':
-       
+                await context.bot.send_photo(
+                    chat_id=update.effective_chat.id,
+                    photo=file_buffer,
+                    caption=caption,
+                    parse_mode=ParseMode.MARKDOWN,
+                    reply_to_message_id=update.message.message_id
+                )
+            else:
+                await context.bot.send_document(
+                    chat_id=update.effective_chat.id,
+                    document=file_buffer,
+                    filename=original_name,
+                    caption=caption,
+                    parse_mode=ParseMode.MARKDOWN,
+                    reply_to_message_id=update.message.message_id
+                )
+            
+            await context.bot.delete_message(
+                chat_id=update.effective_chat.id,
+                message_id=upload_msg.message_id
+            )
+            
+            # Clean up from MongoDB after successful upload
+            await self.db.fs.files.delete_one({'_id': file_id})
+            await self.db.fs.chunks.delete_many({'files_id': file_id})
+            
+            success_text = (
+                f"✅ **Upload completed successfully!**\n\n"
+                f"📁 **File:** {original_name}\n"
+                f"📊 **Size:** {self.format_file_size(file_size)}\n"
+                f"🔗 **Direct Link:** [Download]({direct_link})"
+            )
+            
+            keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔗 Direct Download", url=direct_link)]
+            ])
+            
+            await update.message.reply_text(
+                success_text,
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=keyboard,
+                disable_web_page_preview=True
+            )
+            
+        except Exception as e:
+            logger.error(f"Upload from MongoDB failed: {e}")
+            await update.message.reply_text(
+                f"❌ **Upload failed**\n"
+                f"Error: {str(e)}\n\n"
+                f"🔗 **Direct Link:** [Download]({direct_link})",
+                parse_mode=ParseMode.MARKDOWN,
+                disable_web_page_preview=True
+            )
+    
+    async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle incoming messages"""
+        text = update.message.text.strip()
+        user_id = update.effective_user.id
+        
+        if not self.is_valid_terabox_url(text):
+            await update.message.reply_text(
+                "❌ **Invalid URL**\n\n"
+                "Please send a valid TeraBox link:\n"
+                "• https://terabox.com/s/...\n"
+                "• https://1024terabox.com/s/...\n"
+                "• https://teraboxapp.com/s/...",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            return
+        
+        processing_msg = await update.message.reply_text(
+            "🔍 **Processing TeraBox link...**\n"
+            "⏳ Extracting file information...",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        
+        try:
+            timeout = aiohttp.ClientTimeout(total=120)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(API_URL + text) as response:
+                    if response.status != 200:
+                        raise Exception(f"API returned status {response.status}")
+                    
+                    data = await response.json()
+            
+            if "📜 Extracted Info" not in data or not data["📜 Extracted Info"]:
+                raise Exception("No file information found")
+            
+            file_info = data["📜 Extracted Info"][0]
+            direct_link = file_info.get("🔽 Direct Download Link")
+            file_name = file_info.get("📂 Title", f"terabox_file_{int(time.time())}")
+            file_size_str = file_info.get("📊 Size", "Unknown")
+            
+            if not direct_link:
+                raise Exception("Direct download link not found")
+            
+            try:
+                if "MB" in file_size_str:
+                    file_size = int(float(file_size_str.split()[0]) * 1024 * 1024)
+                elif "GB" in file_size_str:
+                    file_size = int(float(file_size_str.split()[0]) * 1024 * 1024 * 1024)
+                elif "KB" in file_size_str:
+                    file_size = int(float(file_size_str.split()[0]) * 1024)
+                else:
+                    file_size = 0
+            except:
+                file_size = 0
+            
+            auto_upload = self.get_user_setting(user_id, 'auto_upload', True)
+            video_format = self.get_user_setting(user_id, 'video_format', 'video')
+            
+            info_text = (
+                f"✅ **Link Extracted Successfully!**\n\n"
+                f"📁 **File:** `{file_name}`\n"
+                f"📊 **Size:** {file_size_str}\n"
+                f"🎬 **Upload as:** {'Video' if self.is_video_file(file_name) and video_format == 'video' else 'Document'}\n"
+                f"🔄 **Auto Upload:** {'Enabled' if auto_upload else 'Disabled'}"
+            )
+            
+            keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔗 Direct Download", url=direct_link)],
+                [InlineKeyboardButton("📥 Download & Upload", callback_data=f"download_{hash(direct_link)}")],
+                [InlineKeyboardButton("⚙️ Settings", callback_data="settings")]
+            ])
+            
+            await context.bot.edit_message_text(
+                chat_id=update.effective_chat.id,
+                message_id=processing_msg.message_id,
+                text=info_text,
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=keyboard,
+                disable_web_page_preview=True
+            )
+            
+            if auto_upload:
+                await self.process_file_download(update, context, direct_link, file_name, file_size)
+            
+        except Exception as e:
+            logger.error(f"Error processing TeraBox link: {e}")
+            error_text = (
+                "❌ **Failed to process TeraBox link**\n\n"
+                "**Possible reasons:**\n"
+                "• Link has expired or is invalid\n"
+                "• File is private or restricted\n"
+                "• API service is temporarily down\n\n"
+                "🔄 **Try again or check the link**"
+            )
+            
+            await context.bot.edit_message_text(
+                chat_id=update.effective_chat.id,
+                message_id=processing_msg.message_id,
+                text=error_text,
+                parse_mode=ParseMode.MARKDOWN
+            )
+    
+    async def process_file_download(self, update: Update, context: ContextTypes.DEFAULT_TYPE, direct_link: str, file_name: str, file_size: int):
+        """Process file download and upload using MongoDB"""
+        try:
+            safe_filename = "".join(c for c in file_name if c.isalnum() or c in (' ', '.', '_', '-')).rstrip()
+            
+            file_id, actual_size = await self.download_to_mongodb(direct_link, safe_filename, update, context)
+            
+            if file_id:
+                await self.upload_from_mongodb(update, context, file_id, file_name, direct_link, actual_size)
+            
+        except Exception as e:
+            logger.error(f"File processing failed: {e}")
+            await update.message.reply_text(
+                f"❌ **Processing failed**\n"
+                f"Error: {str(e)}\n\n"
+                f"🔗 **Direct Link:** [Download]({direct_link})",
+                parse_mode=ParseMode.MARKDOWN,
+                disable_web_page_preview=True
+            )
+    
+    async def run_polling(self):
+        """Run bot in polling mode"""
+        try:
+            logger.info("🚀 Starting TeraBox Bot Premium with MongoDB...")
+            
+            # Initialize MongoDB
+            await self.init_mongodb()
+            
+            # Initialize application
+            await self.application.initialize()
+            await self.application.start()
+            
+            # Start polling
+            await self.application.updater.start_polling(
+                poll_interval=1.0,
+                timeout=20,
+                bootstrap_retries=-1,
+                read_timeout=60,
+                write_timeout=60,
+                connect_timeout=60,
+                pool_timeout=60
+            )
+            
+            logger.info("✅ Bot is running and polling for updates...")
+            
+            # Keep the bot running
+            await self.application.updater.idle()
+            
+        except Exception as e:
+            logger.error(f"❌ Error starting bot: {e}")
+        finally:
+            # Cleanup
+            if self.mongo_client:
+                self.mongo_client.close()
+            await self.application.stop()
+            await self.application.shutdown()
+
+def main():
+    """Main function to run the bot"""
+    try:
+        bot = TeraBoxBot()
+        asyncio.run(bot.run_polling())
+        
+    except KeyboardInterrupt:
+        logger.info("🛑 Bot stopped by user")
+    except Exception as e:
+        logger.error(f"❌ Fatal error: {e}")
+
+if __name__ == '__main__':
+    if not BOT_TOKEN or BOT_TOKEN == 'YOUR_BOT_TOKEN':
+        logger.error("❌ BOT_TOKEN environment variable not set!")
+        exit(1)
+    
+    if not MONGODB_URI or MONGODB_URI == 'mongodb://localhost:27017':
+        logger.error("❌ MONGODB_URI environment variable not set!")
+        exit(1)
+    
+    main()
