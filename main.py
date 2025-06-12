@@ -28,22 +28,40 @@ TERABOX_API = "https://terabox-fzslcxeeh-nybotxs-projects.vercel.app/"
 PORT = int(os.getenv('PORT', 8080))  # Koyeb port
 WEBHOOK_URL = os.getenv('WEBHOOK_URL', '')  # Optional webhook URL
 
+# Validate required environment variables
+if not BOT_TOKEN:
+    logger.error("BOT_TOKEN environment variable is required!")
+    exit(1)
+
 # MongoDB setup with GridFS
-client = MongoClient(MONGODB_URI)
-db = client.terabox_bot
-fs = gridfs.GridFS(db)
-downloads_collection = db.downloads
-users_collection = db.users
+try:
+    client = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=5000)
+    # Test connection
+    client.admin.command('ping')
+    db = client.terabox_bot
+    fs = gridfs.GridFS(db)
+    downloads_collection = db.downloads
+    users_collection = db.users
+    logger.info("MongoDB connection established successfully")
+except Exception as e:
+    logger.error(f"Failed to connect to MongoDB: {e}")
+    exit(1)
 
 class TeraboxBot:
     def __init__(self):
         self.session = None
         self.keep_alive_task = None
         self.last_activity = time.time()
+        self.start_time = time.time()
         
     async def start_session(self):
         if not self.session:
-            self.session = aiohttp.ClientSession()
+            connector = aiohttp.TCPConnector(limit=100, limit_per_host=30)
+            timeout = aiohttp.ClientTimeout(total=300, connect=30)
+            self.session = aiohttp.ClientSession(
+                connector=connector,
+                timeout=timeout
+            )
     
     async def close_session(self):
         if self.session:
@@ -117,6 +135,7 @@ class TeraboxBot:
             
             async with self.session.get(download_url, timeout=None) as response:
                 if response.status != 200:
+                    logger.error(f"Download failed with status: {response.status}")
                     return None
                 
                 total_size = int(response.headers.get('content-length', 0))
@@ -144,10 +163,12 @@ class TeraboxBot:
                     file_buffer.getvalue(),
                     filename=filename,
                     content_type='application/octet-stream',
-                    upload_date=datetime.utcnow()
+                    upload_date=datetime.utcnow(),
+                    metadata={'downloaded_at': time.time()}
                 )
                 
                 file_buffer.close()
+                logger.info(f"File {filename} stored in GridFS with ID: {file_id}")
                 return file_id
                 
         except Exception as e:
@@ -166,6 +187,7 @@ class TeraboxBot:
         """Delete file from MongoDB GridFS"""
         try:
             fs.delete(file_id)
+            logger.info(f"File {file_id} deleted from GridFS")
             return True
         except Exception as e:
             logger.error(f"Error deleting file: {e}")
@@ -182,7 +204,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Store user info
     users_collection.update_one(
         {"user_id": user_id},
-        {"$set": {"username": username, "last_active": time.time()}},
+        {"$set": {
+            "username": username, 
+            "last_active": time.time(),
+            "first_interaction": time.time()
+        }},
         upsert=True
     )
     
@@ -280,7 +306,7 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 💽 Storage Used: {gridfs_size_mb:.2f} MB
 
 🚀 **Hosting:** Koyeb 24/7
-⏰ **Uptime:** Active
+⏰ **Uptime:** {(time.time() - bot_instance.start_time) / 3600:.1f} hours
 
 **Credits:** NY BOTZ
     """
@@ -298,7 +324,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except:
         mongodb_status = "❌ Disconnected"
     
-    uptime = time.time() - bot_instance.last_activity if hasattr(bot_instance, 'start_time') else 0
+    uptime = time.time() - bot_instance.start_time
     uptime_hours = uptime / 3600
     
     status_text = f"""
@@ -310,6 +336,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 🔗 **API Session:** {'✅ Active' if bot_instance.session else '❌ Inactive'}
 
 ⏰ **Last Activity:** {datetime.fromtimestamp(bot_instance.last_activity).strftime('%Y-%m-%d %H:%M:%S')}
+🕐 **Uptime:** {uptime_hours:.1f} hours
 🚀 **Platform:** 24/7 Cloud Hosting
 
 💡 **Keep-Alive:** Active
@@ -601,19 +628,18 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.error(f"Update {update} caused error {context.error}")
     bot_instance.last_activity = time.time()
 
+async def shutdown_handler(application):
+    """Graceful shutdown handler"""
+    logger.info("Shutting down bot...")
+    await bot_instance.close_session()
+    if bot_instance.keep_alive_task:
+        bot_instance.keep_alive_task.cancel()
+    client.close()
+    logger.info("Bot shutdown complete")
+
 def main():
     """Main function to run the bot"""
-    if not BOT_TOKEN:
-        logger.error("BOT_TOKEN not found in environment variables")
-        return
-    
-    # Test MongoDB connection
-    try:
-        client.admin.command('ping')
-        logger.info("MongoDB connection successful")
-    except Exception as e:
-        logger.error(f"MongoDB connection failed: {e}")
-        return
+    logger.info("Starting Terabox Download Bot...")
     
     # Create application
     application = Application.builder().token(BOT_TOKEN).build()
@@ -624,51 +650,40 @@ def main():
     application.add_handler(CommandHandler("stats", stats_command))
     application.add_handler(CommandHandler("status", status_command))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_terabox_link))
-    application.add_handler(CallbackQueryHandler(handle_download_callback, pattern="^download_"))
+    application.add_handler(CallbackQueryHandler(handle_download_callback, pattern=r"^download_"))
     
     # Add error handler
     application.add_error_handler(error_handler)
     
     # Start keep-alive task
-    async def start_keep_alive():
-        if not bot_instance.keep_alive_task:
-            bot_instance.keep_alive_task = asyncio.create_task(bot_instance.keep_alive())
-    
-    # Set up the bot startup
     async def post_init(application):
-        await start_keep_alive()
+        bot_instance.keep_alive_task = asyncio.create_task(bot_instance.keep_alive())
         logger.info("Keep-alive task started")
     
+    # Add shutdown handler
+    async def post_shutdown(application):
+        await shutdown_handler(application)
+    
     application.post_init = post_init
+    application.post_shutdown = post_shutdown
     
-    # Start bot
-    logger.info("Starting Terabox Download Bot on Koyeb (24/7 mode)...")
-    
-    # Use webhook if URL is provided, otherwise use polling
+    # Run the bot
     if WEBHOOK_URL:
+        # Use webhook for production
+        logger.info(f"Starting webhook on port {PORT}")
         application.run_webhook(
             listen="0.0.0.0",
             port=PORT,
-            url_path=BOT_TOKEN,
-            webhook_url=f"{WEBHOOK_URL}/{BOT_TOKEN}"
+            webhook_url=WEBHOOK_URL,
+            url_path=BOT_TOKEN
         )
     else:
-        # For polling mode with keep-alive
+        # Use polling for development
+        logger.info("Starting polling...")
         application.run_polling(
-            drop_pending_updates=True,
-            allowed_updates=Update.ALL_TYPES
+            allowed_updates=Update.ALL_TYPES,
+            drop_pending_updates=True
         )
 
 if __name__ == '__main__':
-    try:
-        main()
-    except KeyboardInterrupt:
-        logger.info("Bot stopped by user")
-    except Exception as e:
-        logger.error(f"Bot crashed: {e}")
-    finally:
-        # Clean up
-        try:
-            asyncio.run(bot_instance.close_session())
-        except:
-            pass      pass
+    main()
