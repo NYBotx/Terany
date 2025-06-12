@@ -9,46 +9,118 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 from telegram.constants import ParseMode
 import asyncio
 import aiohttp
-import aiofiles
 from datetime import datetime
 import mimetypes
-from flask import Flask, request
+import pymongo
+from gridfs import GridFS
+import tempfile
+from flask import Flask, request, jsonify
 import threading
-from pymongo import MongoClient
-import gridfs
-import io
+from werkzeug.serving import run_simple
 
 # Configure logging
-logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
 logger = logging.getLogger(__name__)
 
 # Configuration
 BOT_TOKEN = os.getenv('BOT_TOKEN', 'YOUR_BOT_TOKEN')
-MONGODB_URI = os.getenv('MONGODB_URI', 'mongodb+srv://Nischay999:Nischay999@cluster0.5kufo.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0')
+MONGODB_URI = os.getenv('MONGODB_URI', 'mongodb://localhost:27017/')
+DATABASE_NAME = os.getenv('DATABASE_NAME', 'terabox_bot')
 API_URL = 'https://wdzone-terabox-api.vercel.app/api?url='
 MAX_FILE_SIZE = 2 * 1024 * 1024 * 1024  # 2GB limit
+TELEGRAM_FILE_LIMIT = 2 * 1024 * 1024 * 1024  # 2GB Telegram limit
 CHUNK_SIZE = 1024 * 1024  # 1MB chunks
-PORT = int(os.getenv('PORT', 8080))
+PORT = int(os.getenv('PORT', 8000))
 
-class TeraBoxBot:
+# Flask app for health checks
+app = Flask(__name__)
+
+@app.route('/')
+def health_check():
+    return jsonify({"status": "healthy", "service": "TeraBox Bot"}), 200
+
+@app.route('/health')
+def health():
+    return jsonify({"status": "ok"}), 200
+
+class MongoDBManager:
     def __init__(self):
-        self.application = Application.builder().token(BOT_TOKEN).build()
-        self.user_settings = {}
-        self.setup_mongodb()
-        self.setup_handlers()
+        self.client = None
+        self.db = None
+        self.fs = None
+        self.connect()
     
-    def setup_mongodb(self):
-        """Setup MongoDB connection"""
+    def connect(self):
+        """Connect to MongoDB"""
         try:
-            self.mongo_client = MongoClient(MONGODB_URI)
-            self.db = self.mongo_client.terabox_bot
-            self.fs = gridfs.GridFS(self.db)
+            self.client = pymongo.MongoClient(MONGODB_URI, serverSelectionTimeoutMS=5000)
+            self.client.server_info()  # Test connection
+            self.db = self.client[DATABASE_NAME]
+            self.fs = GridFS(self.db)
             logger.info("✅ MongoDB connected successfully")
         except Exception as e:
             logger.error(f"❌ MongoDB connection failed: {e}")
-            self.mongo_client = None
-            self.db = None
-            self.fs = None
+            raise
+    
+    def store_file(self, file_data, filename, metadata=None):
+        """Store file in GridFS"""
+        try:
+            file_id = self.fs.put(file_data, filename=filename, metadata=metadata or {})
+            return str(file_id)
+        except Exception as e:
+            logger.error(f"❌ Error storing file: {e}")
+            return None
+    
+    def get_file(self, file_id):
+        """Retrieve file from GridFS"""
+        try:
+            from bson import ObjectId
+            grid_out = self.fs.get(ObjectId(file_id))
+            return grid_out
+        except Exception as e:
+            logger.error(f"❌ Error retrieving file: {e}")
+            return None
+    
+    def delete_file(self, file_id):
+        """Delete file from GridFS"""
+        try:
+            from bson import ObjectId
+            self.fs.delete(ObjectId(file_id))
+            return True
+        except Exception as e:
+            logger.error(f"❌ Error deleting file: {e}")
+            return False
+    
+    def save_user_settings(self, user_id, settings):
+        """Save user settings"""
+        try:
+            self.db.user_settings.update_one(
+                {"user_id": user_id},
+                {"$set": {"settings": settings, "updated_at": datetime.now()}},
+                upsert=True
+            )
+            return True
+        except Exception as e:
+            logger.error(f"❌ Error saving user settings: {e}")
+            return False
+    
+    def get_user_settings(self, user_id):
+        """Get user settings"""
+        try:
+            result = self.db.user_settings.find_one({"user_id": user_id})
+            return result.get("settings", {}) if result else {}
+        except Exception as e:
+            logger.error(f"❌ Error getting user settings: {e}")
+            return {}
+
+class TeraBoxBot:
+    def __init__(self):
+        self.db_manager = MongoDBManager()
+        self.application = Application.builder().token(BOT_TOKEN).build()
+        self.setup_handlers()
     
     def setup_handlers(self):
         """Setup command and message handlers"""
@@ -61,17 +133,19 @@ class TeraBoxBot:
     
     def get_user_setting(self, user_id, setting, default):
         """Get user setting with default value"""
-        return self.user_settings.get(user_id, {}).get(setting, default)
+        settings = self.db_manager.get_user_settings(user_id)
+        return settings.get(setting, default)
     
     def set_user_setting(self, user_id, setting, value):
         """Set user setting"""
-        if user_id not in self.user_settings:
-            self.user_settings[user_id] = {}
-        self.user_settings[user_id][setting] = value
+        settings = self.db_manager.get_user_settings(user_id)
+        settings[setting] = value
+        self.db_manager.save_user_settings(user_id, settings)
     
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Start command handler"""
-        welcome_text = """🚀 **TeraBox Direct Link Bot - Premium**
+        welcome_text = """
+🚀 **TeraBox Direct Link Bot - Premium**
 
 🔥 **Features:**
 • Extract direct download links from TeraBox
@@ -79,12 +153,12 @@ class TeraBoxBot:
 • Full video support without splitting
 • Customizable upload format (Video/Document)
 • Progress tracking with real-time updates
-• Support for all file formats
+• MongoDB cloud storage integration
 
 📝 **How to use:**
 1. Send any TeraBox share link
 2. Bot will extract direct download link
-3. Files are automatically processed and uploaded as full files
+3. Files are automatically processed and uploaded
 
 💡 **Commands:**
 /start - Show this welcome message
@@ -92,10 +166,12 @@ class TeraBoxBot:
 /stats - Bot statistics
 /settings - Configure bot settings
 
-⚡ **Just send a TeraBox link to get started!**"""
+⚡ **Just send a TeraBox link to get started!**
+        """
         
         keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("📚 Help", callback_data="help"), InlineKeyboardButton("⚙️ Settings", callback_data="settings")],
+            [InlineKeyboardButton("📚 Help", callback_data="help"),
+             InlineKeyboardButton("⚙️ Settings", callback_data="settings")],
             [InlineKeyboardButton("📊 Stats", callback_data="stats")]
         ])
         
@@ -103,7 +179,8 @@ class TeraBoxBot:
     
     async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Help command handler"""
-        help_text = """📖 **Detailed Help Guide**
+        help_text = """
+📖 **Detailed Help Guide**
 
 🔗 **Supported Links:**
 • TeraBox share links (https://terabox.com/...)
@@ -119,7 +196,7 @@ https://1024terabox.com/s/1XYZ789...
 💾 **File Processing:**
 • All files up to 2GB are uploaded as complete files
 • No splitting - videos remain intact
-• Customizable upload format
+• Cloud storage with MongoDB
 
 ⚙️ **Settings:**
 • Video Format: Upload videos as Video or Document
@@ -130,27 +207,35 @@ https://1024terabox.com/s/1XYZ789...
 • Processing time varies with file size
 • Requires Telegram Premium for files >50MB
 
-💬 **Support:** Forward any issues to bot admin"""
+💬 **Support:** Forward any issues to bot admin
+        """
         
         await update.message.reply_text(help_text, parse_mode=ParseMode.MARKDOWN)
     
     async def stats(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Stats command handler"""
-        stats_text = f"""📊 **Bot Statistics**
+        try:
+            user_count = self.db_manager.db.user_settings.count_documents({})
+        except:
+            user_count = 0
+            
+        stats_text = f"""
+📊 **Bot Statistics**
 
 🕒 **Uptime:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
-🤖 **Bot Version:** v4.0 Premium (2GB Full Files)
+🤖 **Bot Version:** v4.0 Premium (MongoDB)
 ⚡ **Status:** Active
 🌐 **API Status:** Connected
-💾 **Storage:** MongoDB GridFS
+💾 **Database:** MongoDB Cloud
 
 💾 **Current Limits:**
 • Max file processing: 2GB
 • Full file upload (no splitting)
 • Video format preservation
-• Concurrent downloads: 2
+• Cloud storage enabled
 
-👥 **Users:** {len(self.user_settings)} active users"""
+👥 **Users:** {user_count} active users
+        """
         
         await update.message.reply_text(stats_text, parse_mode=ParseMode.MARKDOWN)
     
@@ -160,18 +245,26 @@ https://1024terabox.com/s/1XYZ789...
         video_format = self.get_user_setting(user_id, 'video_format', 'video')
         auto_upload = self.get_user_setting(user_id, 'auto_upload', True)
         
-        settings_text = f"""⚙️ **Bot Settings**
+        settings_text = f"""
+⚙️ **Bot Settings**
 
 📹 **Video Format:** {'🎬 Video' if video_format == 'video' else '📄 Document'}
 🔄 **Auto Upload:** {'✅ Enabled' if auto_upload else '❌ Disabled'}
 
 **Current Settings:**
 • Videos will be uploaded as {'Video files' if video_format == 'video' else 'Documents'}
-• Auto upload is {'enabled' if auto_upload else 'disabled'}"""
+• Auto upload is {'enabled' if auto_upload else 'disabled'}
+        """
         
         keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton(f"📹 Video Format: {'Video' if video_format == 'video' else 'Document'}", callback_data="toggle_video_format")],
-            [InlineKeyboardButton(f"🔄 Auto Upload: {'ON' if auto_upload else 'OFF'}", callback_data="toggle_auto_upload")],
+            [InlineKeyboardButton(
+                f"📹 Video Format: {'Video' if video_format == 'video' else 'Document'}", 
+                callback_data="toggle_video_format"
+            )],
+            [InlineKeyboardButton(
+                f"🔄 Auto Upload: {'ON' if auto_upload else 'OFF'}", 
+                callback_data="toggle_auto_upload"
+            )],
             [InlineKeyboardButton("🔙 Back to Main", callback_data="main_menu")]
         ])
         
@@ -266,12 +359,13 @@ https://1024terabox.com/s/1XYZ789...
             return f"{int(seconds // 3600)}h {int((seconds % 3600) // 60)}m"
     
     async def download_and_store_file(self, url, filename, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Download file and store in MongoDB GridFS"""
-        if not self.fs:
-            await update.message.reply_text("❌ MongoDB storage not available")
-            return None
-        
+        """Download file and store in MongoDB"""
         try:
+            progress_msg = await update.message.reply_text(
+                "⬇️ **Starting download...**\n📡 Connecting to server...",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            
             timeout = aiohttp.ClientTimeout(total=3600)
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.get(url) as response:
@@ -285,166 +379,182 @@ https://1024terabox.com/s/1XYZ789...
                             f"❌ File too large ({self.format_file_size(total_size)})\n"
                             f"Maximum allowed: {self.format_file_size(MAX_FILE_SIZE)}"
                         )
-                        return None
+                        return None, None
                     
-                    progress_msg = await update.message.reply_text(
-                        f"⬇️ **Downloading to MongoDB...**\n📊 File size: {self.format_file_size(total_size)}",
+                    # Use temporary file for download
+                    with tempfile.NamedTemporaryFile(delete=False) as temp_file:
+                        downloaded = 0
+                        last_update_time = time.time()
+                        last_update_percent = 0
+                        start_time = time.time()
+                        
+                        async for chunk in response.content.iter_chunked(CHUNK_SIZE):
+                            temp_file.write(chunk)
+                            downloaded += len(chunk)
+                            
+                            if total_size > 0:
+                                percent = (downloaded / total_size) * 100
+                                current_time = time.time()
+                                
+                                if (percent - last_update_percent >= 5) or (current_time - last_update_time >= 10):
+                                    elapsed_time = current_time - start_time
+                                    speed = downloaded / elapsed_time if elapsed_time > 0 else 0
+                                    eta = (total_size - downloaded) / speed if speed > 0 else 0
+                                    
+                                    msg = (
+                                        f"⬇️ **Downloading...**\n"
+                                        f"{self.progress_bar(percent)}\n"
+                                        f"📊 {self.format_file_size(downloaded)} / {self.format_file_size(total_size)}\n"
+                                        f"🚀 Speed: {self.format_file_size(speed)}/s\n"
+                                        f"⏱️ ETA: {self.format_time(eta)}"
+                                    )
+                                    try:
+                                        await context.bot.edit_message_text(
+                                            chat_id=update.effective_chat.id,
+                                            message_id=progress_msg.message_id,
+                                            text=msg,
+                                            parse_mode=ParseMode.MARKDOWN
+                                        )
+                                        last_update_percent = percent
+                                        last_update_time = current_time
+                                    except:
+                                        pass
+                        
+                        temp_file_path = temp_file.name
+                    
+                    # Store in MongoDB
+                    await context.bot.edit_message_text(
+                        chat_id=update.effective_chat.id,
+                        message_id=progress_msg.message_id,
+                        text="💾 **Storing file in cloud...**",
                         parse_mode=ParseMode.MARKDOWN
                     )
                     
-                    # Store file in GridFS
-                    file_buffer = io.BytesIO()
-                    downloaded = 0
-                    last_update_time = time.time()
-                    last_update_percent = 0
-                    start_time = time.time()
+                    with open(temp_file_path, 'rb') as f:
+                        file_data = f.read()
                     
-                    async for chunk in response.content.iter_chunked(CHUNK_SIZE):
-                        file_buffer.write(chunk)
-                        downloaded += len(chunk)
-                        
-                        if total_size > 0:
-                            percent = (downloaded / total_size) * 100
-                            current_time = time.time()
-                            
-                            if (percent - last_update_percent >= 5) or (current_time - last_update_time >= 10):
-                                elapsed_time = current_time - start_time
-                                speed = downloaded / elapsed_time if elapsed_time > 0 else 0
-                                eta = (total_size - downloaded) / speed if speed > 0 else 0
-                                
-                                msg = (
-                                    f"⬇️ **Downloading to MongoDB...**\n"
-                                    f"{self.progress_bar(percent)}\n"
-                                    f"📊 {self.format_file_size(downloaded)} / {self.format_file_size(total_size)}\n"
-                                    f"🚀 Speed: {self.format_file_size(speed)}/s\n"
-                                    f"⏱️ ETA: {self.format_time(eta)}"
-                                )
-                                try:
-                                    await context.bot.edit_message_text(
-                                        chat_id=update.effective_chat.id,
-                                        message_id=progress_msg.message_id,
-                                        text=msg,
-                                        parse_mode=ParseMode.MARKDOWN
-                                    )
-                                    last_update_percent = percent
-                                    last_update_time = current_time
-                                except:
-                                    pass
+                    # Clean up temp file
+                    os.unlink(temp_file_path)
                     
-                    # Store in GridFS
-                    file_buffer.seek(0)
-                    file_id = self.fs.put(file_buffer.getvalue(), filename=filename)
+                    # Store in MongoDB
+                    file_id = self.db_manager.store_file(
+                        file_data, 
+                        filename,
+                        {"size": len(file_data), "upload_date": datetime.now()}
+                    )
                     
                     await context.bot.delete_message(
                         chat_id=update.effective_chat.id,
                         message_id=progress_msg.message_id
                     )
                     
-                    return file_id
+                    return file_data, file_id
                     
         except Exception as e:
             logger.error(f"Download failed: {e}")
-            return None
+            return None, None
     
-    async def upload_file_from_mongodb(self, update: Update, context: ContextTypes.DEFAULT_TYPE, file_id, original_name: str, direct_link: str, file_size: int):
-        """Upload file from MongoDB to Telegram"""
-        if not self.fs:
-            return
-        
+    async def upload_file_to_telegram(self, update: Update, context: ContextTypes.DEFAULT_TYPE, file_data: bytes, filename: str, file_id: str, direct_link: str):
+        """Upload file to Telegram"""
         user_id = update.effective_user.id
         video_format = self.get_user_setting(user_id, 'video_format', 'video')
         
         try:
             upload_msg = await update.message.reply_text(
-                f"⬆️ **Uploading to Telegram...**\n📁 {original_name}\n📊 {self.format_file_size(file_size)}",
+                f"⬆️ **Uploading to Telegram...**\n"
+                f"📁 {filename}\n"
+                f"📊 {self.format_file_size(len(file_data))}",
                 parse_mode=ParseMode.MARKDOWN
             )
             
-            # Get file from GridFS
-            grid_file = self.fs.get(file_id)
-            file_data = grid_file.read()
+            file_type = self.get_file_type(filename)
+            caption = f"📁 **{filename}**\n📊 Size: {self.format_file_size(len(file_data))}"
             
-            file_type = self.get_file_type(original_name)
-            caption = f"📁 **{original_name}**\n📊 Size: {self.format_file_size(file_size)}"
+            # Create temporary file for Telegram upload
+            with tempfile.NamedTemporaryFile(delete=False) as temp_file:
+                temp_file.write(file_data)
+                temp_file_path = temp_file.name
             
-            file_obj = io.BytesIO(file_data)
-            file_obj.name = original_name
-            
-            if file_type == 'video' and video_format == 'video':
-                await context.bot.send_video(
+            try:
+                with open(temp_file_path, 'rb') as file:
+                    if file_type == 'video' and video_format == 'video':
+                        await context.bot.send_video(
+                            chat_id=update.effective_chat.id,
+                            video=file,
+                            filename=filename,
+                            caption=caption,
+                            parse_mode=ParseMode.MARKDOWN,
+                            supports_streaming=True,
+                            reply_to_message_id=update.message.message_id
+                        )
+                    elif file_type == 'audio':
+                        await context.bot.send_audio(
+                            chat_id=update.effective_chat.id,
+                            audio=file,
+                            filename=filename,
+                            caption=caption,
+                            parse_mode=ParseMode.MARKDOWN,
+                            reply_to_message_id=update.message.message_id
+                        )
+                    elif file_type == 'photo':
+                        await context.bot.send_photo(
+                            chat_id=update.effective_chat.id,
+                            photo=file,
+                            caption=caption,
+                            parse_mode=ParseMode.MARKDOWN,
+                            reply_to_message_id=update.message.message_id
+                        )
+                    else:
+                        await context.bot.send_document(
+                            chat_id=update.effective_chat.id,
+                            document=file,
+                            filename=filename,
+                            caption=caption,
+                            parse_mode=ParseMode.MARKDOWN,
+                            reply_to_message_id=update.message.message_id
+                        )
+                
+                await context.bot.delete_message(
                     chat_id=update.effective_chat.id,
-                    video=file_obj,
-                    filename=original_name,
-                    caption=caption,
-                    parse_mode=ParseMode.MARKDOWN,
-                    supports_streaming=True,
-                    reply_to_message_id=update.message.message_id
+                    message_id=upload_msg.message_id
                 )
-            elif file_type == 'audio':
-                await context.bot.send_audio(
-                    chat_id=update.effective_chat.id,
-                    audio=file_obj,
-                    filename=original_name,
-                    caption=caption,
-                    parse_mode=ParseMode.MARKDOWN,
-                    reply_to_message_id=update.message.message_id
+                
+                success_text = (
+                    f"✅ **Upload completed successfully!**\n\n"
+                    f"📁 **File:** {filename}\n"
+                    f"📊 **Size:** {self.format_file_size(len(file_data))}\n"
+                    f"🔗 **Direct Link:** [Download]({direct_link})"
                 )
-            elif file_type == 'photo':
-                await context.bot.send_photo(
-                    chat_id=update.effective_chat.id,
-                    photo=file_obj,
-                    caption=caption,
+                
+                keyboard = InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔗 Direct Download", url=direct_link)]
+                ])
+                
+                await update.message.reply_text(
+                    success_text,
                     parse_mode=ParseMode.MARKDOWN,
-                    reply_to_message_id=update.message.message_id
+                    reply_markup=keyboard,
+                    disable_web_page_preview=True
                 )
-            else:
-                await context.bot.send_document(
-                    chat_id=update.effective_chat.id,
-                    document=file_obj,
-                    filename=original_name,
-                    caption=caption,
-                    parse_mode=ParseMode.MARKDOWN,
-                    reply_to_message_id=update.message.message_id
-                )
-            
-            await context.bot.delete_message(
-                chat_id=update.effective_chat.id,
-                message_id=upload_msg.message_id
-            )
-            
-            success_text = (
-                f"✅ **Upload completed successfully!**\n\n"
-                f"📁 **File:** {original_name}\n"
-                f"📊 **Size:** {self.format_file_size(file_size)}\n"
-                f"🔗 **Direct Link:** [Download]({direct_link})"
-            )
-            
-            keyboard = InlineKeyboardMarkup([
-                [InlineKeyboardButton("🔗 Direct Download", url=direct_link)]
-            ])
-            
-            await update.message.reply_text(
-                success_text,
-                parse_mode=ParseMode.MARKDOWN,
-                reply_markup=keyboard,
-                disable_web_page_preview=True
-            )
-            
-            # Clean up from MongoDB
-            self.fs.delete(file_id)
-            
+                
+            finally:
+                # Clean up temp file
+                if os.path.exists(temp_file_path):
+                    os.unlink(temp_file_path)
+                
+                # Clean up MongoDB file
+                if file_id:
+                    self.db_manager.delete_file(file_id)
+                    
         except Exception as e:
             logger.error(f"Upload failed: {e}")
             await update.message.reply_text(
-                f"❌ **Upload failed**\nError: {str(e)}\n\n🔗 **Direct Link:** [Download]({direct_link})",
+                f"❌ **Upload failed**\n"
+                f"Error: {str(e)}\n\n"
+                f"🔗 **Direct Link:** [Download]({direct_link})",
                 parse_mode=ParseMode.MARKDOWN,
                 disable_web_page_preview=True
             )
-            # Clean up from MongoDB
-            try:
-                self.fs.delete(file_id)
-            except:
-                pass
     
     async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle incoming messages"""
@@ -453,13 +563,18 @@ https://1024terabox.com/s/1XYZ789...
         
         if not self.is_valid_terabox_url(text):
             await update.message.reply_text(
-                "❌ **Invalid URL**\n\nPlease send a valid TeraBox link:\n• https://terabox.com/s/...\n• https://1024terabox.com/s/...\n• https://teraboxapp.com/s/...",
+                "❌ **Invalid URL**\n\n"
+                "Please send a valid TeraBox link:\n"
+                "• https://terabox.com/s/...\n"
+                "• https://1024terabox.com/s/...\n"
+                "• https://teraboxapp.com/s/...",
                 parse_mode=ParseMode.MARKDOWN
             )
             return
         
         processing_msg = await update.message.reply_text(
-            "🔍 **Processing TeraBox link...**\n⏳ Extracting file information...",
+            "🔍 **Processing TeraBox link...**\n"
+            "⏳ Extracting file information...",
             parse_mode=ParseMode.MARKDOWN
         )
         
@@ -469,6 +584,7 @@ https://1024terabox.com/s/1XYZ789...
                 async with session.get(API_URL + text) as response:
                     if response.status != 200:
                         raise Exception(f"API returned status {response.status}")
+                    
                     data = await response.json()
             
             if "📜 Extracted Info" not in data or not data["📜 Extracted Info"]:
@@ -521,14 +637,19 @@ https://1024terabox.com/s/1XYZ789...
             )
             
             if auto_upload:
-                await self.process_file_download(update, context, direct_link, file_name, file_size)
+                file_data, file_id = await self.download_and_store_file(direct_link, file_name, update, context)
+                if file_data:
+                    await self.upload_file_to_telegram(update, context, file_data, file_name, file_id, direct_link)
             
         except Exception as e:
             logger.error(f"Error processing TeraBox link: {e}")
             error_text = (
-                "❌ **Failed to process TeraBox link**\n\n**Possible reasons:**\n"
-                "• Link has expired or is invalid\n• File is private or restricted\n"
-                "• API service is temporarily down\n\n🔄 **Try again or check the link**"
+                "❌ **Failed to process TeraBox link**\n\n"
+                "**Possible reasons:**\n"
+                "• Link has expired or is invalid\n"
+                "• File is private or restricted\n"
+                "• API service is temporarily down\n\n"
+                "🔄 **Try again or check the link**"
             )
             
             await context.bot.edit_message_text(
@@ -537,71 +658,47 @@ https://1024terabox.com/s/1XYZ789...
                 text=error_text,
                 parse_mode=ParseMode.MARKDOWN
             )
-    
-    async def process_file_download(self, update: Update, context: ContextTypes.DEFAULT_TYPE, direct_link: str, file_name: str, file_size: int):
-        """Process file download and upload using MongoDB"""
-        try:
-            file_id = await self.download_and_store_file(direct_link, file_name, update, context)
-            if file_id:
-                await self.upload_file_from_mongodb(update, context, file_id, file_name, direct_link, file_size)
-        except Exception as e:
-            logger.error(f"File processing failed: {e}")
-            await update.message.reply_text(
-                f"❌ **Processing failed**\nError: {str(e)}\n\n🔗 **Direct Link:** [Download]({direct_link})",
-                parse_mode=ParseMode.MARKDOWN,
-                disable_web_page_preview=True
-            )
-
-# Flask app for webhook
-app = Flask(__name__)
-bot_instance = TeraBoxBot()
-
-@app.route('/')
-def home():
-    return "TeraBox Bot is running!"
-
-@app.route(f'/{BOT_TOKEN}', methods=['POST'])
-def webhook():
-    """Handle webhook updates"""
-    try:
-        update = Update.de_json(request.get_json(force=True), bot_instance.application.bot)
-        asyncio.run(bot_instance.application.process_update(update))
-        return "OK"
-    except Exception as e:
-        logger.error(f"Webhook error: {e}")
-        return "Error", 500
 
 def run_flask():
     """Run Flask app"""
-    app.run(host='0.0.0.0', port=PORT, debug=False)
+    run_simple('0.0.0.0', PORT, app, threaded=True, use_reloader=False, use_debugger=False)
 
-async def setup_webhook():
-    """Setup webhook for the bot"""
-    webhook_url = f"https://your-app-name.koyeb.app/{BOT_TOKEN}"
-    await bot_instance.application.bot.set_webhook(webhook_url)
-    logger.info(f"Webhook set to: {webhook_url}")
+async def run_bot():
+    """Run the Telegram bot"""
+    try:
+        bot = TeraBoxBot()
+        logger.info("🚀 Starting TeraBox Bot Premium...")
+        
+        await bot.application.initialize()
+        await bot.application.start()
+        
+        await bot.application.updater.start_polling(
+            poll_interval=1.0,
+            timeout=20,
+            bootstrap_retries=-1,
+            read_timeout=60,
+            write_timeout=60,
+            connect_timeout=60,
+            pool_timeout=60
+        )
+        
+        logger.info("✅ Bot is running and polling for updates...")
+        await bot.application.updater.idle()
+        
+    except Exception as e:
+        logger.error(f"❌ Error running bot: {e}")
 
 def main():
-    """Main function to run the bot with Flask"""
+    """Main function"""
     try:
-        # Initialize the bot application
-        asyncio.run(bot_instance.application.initialize())
-        
-        # Setup webhook
-        asyncio.run(setup_webhook())
-        
         # Start Flask in a separate thread
-        flask_thread = threading.Thread(target=run_flask)
-        flask_thread.daemon = True
+        flask_thread = threading.Thread(target=run_flask, daemon=True)
         flask_thread.start()
+        logger.info(f"🌐 Flask server started on port {PORT}")
         
-        logger.info(f"🚀 TeraBox Bot started on port {PORT}")
-        logger.info("✅ Bot is running with MongoDB storage and webhook mode")
+        # Run the bot
+        asyncio.run(run_bot())
         
-        # Keep the main thread alive
-        while True:
-            time.sleep(1)
-            
     except KeyboardInterrupt:
         logger.info("🛑 Bot stopped by user")
     except Exception as e:
@@ -610,10 +707,6 @@ def main():
 if __name__ == '__main__':
     if not BOT_TOKEN or BOT_TOKEN == 'YOUR_BOT_TOKEN':
         logger.error("❌ BOT_TOKEN environment variable not set!")
-        exit(1)
-    
-    if not MONGODB_URI:
-        logger.error("❌ MONGODB_URI environment variable not set!")
         exit(1)
     
     main()
