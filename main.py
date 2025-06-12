@@ -26,7 +26,7 @@ BOT_TOKEN = os.getenv('BOT_TOKEN')
 MONGODB_URI = os.getenv('MONGODB_URI', 'mongodb://localhost:27017/')
 TERABOX_API = "https://terabox-fzslcxeeh-nybotxs-projects.vercel.app/"
 PORT = int(os.getenv('PORT', 8080))  # Koyeb port
-WEBHOOK_URL = os.getenv('WEBHOOK_URL', 'https://shaky-bonnie-nybotz-4e34dced.koyeb.app/')  # Optional webhook URL
+WEBHOOK_URL = os.getenv('WEBHOOK_URL', '')  # Optional webhook URL
 
 # Validate required environment variables
 if not BOT_TOKEN:
@@ -667,23 +667,15 @@ def main():
     application.post_init = post_init
     application.post_shutdown = post_shutdown
     
-    # Run the bot
-    if WEBHOOK_URL:
-        # Use webhook for production
-        logger.info(f"Starting webhook on port {PORT}")
-        application.run_webhook(
-            listen="0.0.0.0",
-            port=PORT,
-            webhook_url=WEBHOOK_URL,
-            url_path=BOT_TOKEN
-        )
-    else:
-        # Use polling for development
-        logger.info("Starting polling...")
-        application.run_polling(
-            allowed_updates=Update.ALL_TYPES,
-            drop_pending_updates=True
-        )
+    # Run the bot - Use polling for Koyeb compatibility
+    # Note: For webhook mode, install with: pip install "python-telegram-bot[webhooks]"
+    logger.info("Starting polling...")
+    application.run_polling(
+        allowed_updates=Update.ALL_TYPES,
+        drop_pending_updates=True,
+        poll_interval=1.0,
+        timeout=10
+    )
 
 if __name__ == '__main__':
     main()
